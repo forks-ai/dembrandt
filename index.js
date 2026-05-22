@@ -28,11 +28,36 @@ import { runLint } from "./lib/lint.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const { version } = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
 
+function loadLintConfig() {
+  try {
+    return JSON.parse(readFileSync(join(process.cwd(), ".dembrandtrc.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function printLintReport(report, out) {
+  out();
+  out(color.accent("Design lint"));
+  if (report.findings.length === 0) {
+    out(chalk.green("  ✓ No issues found"));
+  } else {
+    for (const f of report.findings) {
+      const sym = f.severity === "error" ? chalk.red("✗") : chalk.hex("#FFB86C")("⚠");
+      out(`  ${sym} ${chalk.bold(f.rule)}  ${f.message}`);
+      if (f.detail) for (const d of f.detail) out(chalk.dim(`      ${d}`));
+    }
+    out();
+    out(chalk.dim(`  ${report.errors} error(s), ${report.warnings} warning(s)`));
+  }
+  out(report.pass ? chalk.green("  Result: PASS") : chalk.red("  Result: FAIL"));
+}
+
 program
   .name("dembrandt")
   .description("Extract design tokens from any website")
   .version(version)
-  .argument("<url>")
+  .argument("[url]", "URL to extract (omit when using --lint-only)")
   .option("--browser <type>", "Browser to use (chromium|firefox); set BROWSER_CDP_ENDPOINT env var to connect to an existing Chromium instance via CDP", "chromium")
   .option("--json-only", "Output raw JSON")
   .option("--save-output", "Save JSON file to output folder")
@@ -47,6 +72,7 @@ program
   .option("--screenshot <path>", "Save a screenshot of the page")
   .option("--wcag", "Analyze WCAG contrast ratios between palette colors")
   .option("--lint", "Run design lint rules; exit non-zero on errors (implies --wcag)")
+  .option("--lint-only <file>", "Lint an existing extract JSON (no browser) and exit")
   .option("--pages <n>", "Analyze up to N total pages including start URL (default: 5)", (v) => {
     const n = parseInt(v, 10);
     if (isNaN(n) || n < 1) throw new Error(`--pages must be a positive integer, got: ${v}`);
@@ -54,6 +80,24 @@ program
   })
   .option("--sitemap", "Discover pages from sitemap.xml instead of DOM links")
   .action(async (input, opts) => {
+    // Lint an existing extract JSON without a browser, then exit.
+    if (opts.lintOnly) {
+      try {
+        const data = JSON.parse(readFileSync(opts.lintOnly, "utf8"));
+        const report = runLint(data, loadLintConfig());
+        printLintReport(report, console.log);
+        process.exitCode = report.pass ? 0 : 1;
+      } catch (err) {
+        console.error(chalk.red(`✗ Could not lint ${opts.lintOnly}: ${err.message}`));
+        process.exitCode = 1;
+      }
+      return;
+    }
+
+    if (!input) {
+      program.error("missing required argument 'url' (use a URL or --lint-only <file>)");
+    }
+
     let url = input;
     if (!url.startsWith("http://") && !url.startsWith("https://")) {
       url = "https://" + url;
@@ -328,28 +372,9 @@ program
 
       // Design lint (--lint): rules + non-zero exit on errors
       if (opts.lint) {
-        let lintConfig = {};
-        try {
-          lintConfig = JSON.parse(readFileSync(join(process.cwd(), ".dembrandtrc.json"), "utf8"));
-        } catch {
-          // no .dembrandtrc.json; use defaults (report-only)
-        }
-        const report = runLint(result, lintConfig);
+        const report = runLint(result, loadLintConfig());
         const out = opts.jsonOnly ? (...a) => console.error(...a) : (...a) => console.log(...a);
-        out();
-        out(color.accent("Design lint"));
-        if (report.findings.length === 0) {
-          out(chalk.green("  ✓ No issues found"));
-        } else {
-          for (const f of report.findings) {
-            const sym = f.severity === "error" ? chalk.red("✗") : chalk.hex("#FFB86C")("⚠");
-            out(`  ${sym} ${chalk.bold(f.rule)}  ${f.message}`);
-            if (f.detail) for (const d of f.detail) out(chalk.dim(`      ${d}`));
-          }
-          out();
-          out(chalk.dim(`  ${report.errors} error(s), ${report.warnings} warning(s)`));
-        }
-        out(report.pass ? chalk.green("  Result: PASS") : chalk.red("  Result: FAIL"));
+        printLintReport(report, out);
         process.exitCode = report.pass ? 0 : 1;
       }
     } catch (err) {
