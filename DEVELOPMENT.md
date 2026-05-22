@@ -157,15 +157,24 @@ git tag -a vx.y.z -m "Release vx.y.z - Description"
 git push origin main --tags
 ```
 
-4. **Publish to npm:**
+4. **Publish to npm (manual):**
+CI cannot publish: the npm account requires 2FA and the `release.yml` token hits an EOTP error. Publish manually from the repo root at the tagged commit:
 ```bash
-npm publish
+npm publish --access public --//registry.npmjs.org/:_authToken=<npm_ token>
 ```
+The `npm_...` granular token bypasses the OTP prompt (`--otp` expects a 6-digit code, not a token).
 
 5. **Verify:**
 ```bash
+npm view dembrandt version
 npx dembrandt@latest example.com
 ```
+
+6. **Create the GitHub release (for notes):**
+```bash
+gh release create vx.y.z --title "vx.y.z" --notes "..."
+```
+This triggers `release.yml`. Its publish step is idempotent: since the version is already on npm from step 4, it skips publish, so the run stays green and `sync-downstream` still runs.
 
 ## Contributing Guidelines
 
