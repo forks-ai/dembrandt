@@ -67,9 +67,9 @@ dembrandt example.com --mobile         # Use mobile viewport (390x844) for respo
 dembrandt example.com --slow           # 3x longer timeouts (24s hydration) for JavaScript-heavy sites
 dembrandt example.com --brand-guide    # Generate a brand guide PDF
 dembrandt example.com --design-md      # Generate a DESIGN.md file for AI agents
-dembrandt example.com --pages 5        # Analyze 5 pages (homepage + 4 discovered pages), merges results
+dembrandt example.com --crawl 5        # Analyze 5 pages (homepage + 4 discovered pages), merges results
 dembrandt example.com --sitemap        # Discover pages from sitemap.xml instead of DOM links
-dembrandt example.com --pages 10 --sitemap # Combine: up to 10 pages discovered via sitemap
+dembrandt example.com --crawl 10 --sitemap # Combine: up to 10 pages discovered via sitemap
 dembrandt example.com --no-sandbox     # Disable Chromium sandbox (required for Docker/CI)
 dembrandt example.com --browser=firefox # Use Firefox instead of Chromium (better for Cloudflare bypass)
 dembrandt example.com --wcag           # WCAG 2.1 contrast analysis — real DOM pairs, AA/AAA grades
@@ -83,13 +83,13 @@ Analyze multiple pages to get a more complete picture of a site's design system.
 
 ```bash
 # Analyze homepage + 4 auto-discovered pages (default: 5 total)
-dembrandt example.com --pages 5
+dembrandt example.com --crawl 5
 
 # Use sitemap.xml for page discovery instead of DOM link scraping
 dembrandt example.com --sitemap
 
 # Combine both: up to 10 pages from sitemap
-dembrandt example.com --pages 10 --sitemap
+dembrandt example.com --crawl 10 --sitemap
 ```
 
 **Page discovery** works two ways:
@@ -197,7 +197,7 @@ dembrandt braintree.com --save-output
 
 **Multi-page audit** — get a fuller picture across the whole site
 ```bash
-dembrandt stripe.com --pages 10 --sitemap --save-output
+dembrandt stripe.com --crawl 10 --sitemap --save-output
 ```
 
 **Spot-check a value** — verify a specific token fast

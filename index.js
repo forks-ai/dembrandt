@@ -132,6 +132,7 @@ program
             screenshotPath: opts.screenshot,
             discoverLinks: isAutoCrawl ? crawlN - 1 : null,
             wcag: opts.wcag,
+            includeRawColors: opts.rawColors,
           });
 
           // Build list of additional URLs to extract
