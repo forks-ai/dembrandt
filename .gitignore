@@ -51,3 +51,4 @@ test/diff-report.md
 *.jpg
 *.jpeg
 test/sites-chunk.json
+.agents/
