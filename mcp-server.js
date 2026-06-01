@@ -15,7 +15,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { chromium } from "playwright-core";
 import { readFileSync } from "node:fs";
-import { extractBranding } from "./lib/extractors.js";
+import { extractBranding } from "./lib/extractors/index.js";
 
 const { version } = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
 
