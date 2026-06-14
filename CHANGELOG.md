@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.19.4] - 2026-06-14
+
+### Fixed
+- Self-hosted font lists (`selfHostedFonts`, `customFonts`) are now deduped and sorted, so two extractions of the same page no longer differ by font order — eliminating phantom design drift
+
+### Added
+- `--approve` accepts the current extraction as the new baseline: with `--compare <file>`, it overwrites that local baseline and passes instead of failing. App baseline ids are read-only
+- `--compare` combined with `--json-only` now attaches the full drift report (score, status, summary, per-token changes) under a `drift` key, so CI gates can render what changed from structured data instead of scraping the HTML report
+
 ## [0.17.1] - 2026-06-10
 
 ### Fixed
