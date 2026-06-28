@@ -3,6 +3,7 @@ import { color } from '../formatters/theme.js';
 import { discoverLinks } from '../discovery.js';
 import { extractLogo, extractSiteName } from './logo.js';
 import { extractColors } from './colors.js';
+import { MENU_TRIGGER_SELECTOR, CAROUSEL_NEXT_SELECTOR } from './menu-triggers.js';
 import { extractTypography } from './typography.js';
 import { extractSpacing, extractBorderRadius, extractBorders, extractShadows } from './spacing.js';
 import { extractButtonStyles, extractInputStyles, extractLinkStyles, extractBadgeStyles } from './components.js';
@@ -263,7 +264,7 @@ async function simulateHumanMouse(page: Page) {
  * @param {string} url
  * @param {import('ora').Ora} spinner
  * @param {import('playwright-core').Browser} browser
- * @param {{ slow?: boolean, darkMode?: boolean, mobile?: boolean, wcag?: boolean, screenshotPath?: string, discoverLinks?: number|null, navigationTimeout?: number, stealth?: boolean, userAgent?: string, locale?: string, timezoneId?: string, acceptLanguage?: string, screenSize?: string }} [options]
+ * @param {{ slow?: boolean, darkMode?: boolean, mobile?: boolean, reveal?: boolean, wcag?: boolean, screenshotPath?: string, discoverLinks?: number|null, navigationTimeout?: number, stealth?: boolean, userAgent?: string, locale?: string, timezoneId?: string, acceptLanguage?: string, screenSize?: string }} [options]
  * @returns {Promise<BrandingResult>}
  */
 export async function extractBranding(url: string, spinner: Spinner, browser: Browser, options: ExtractOptions = {}): Promise<BrandingResult> {
@@ -875,6 +876,76 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
       }
     } catch (e) { degraded.push('svg-logo-colors'); console.log(color.warning('  ! SVG logo color injection: failed (continuing)')); }
 
+    // Inject chromatic gradient stop colours as low-confidence palette entries.
+    // Brand gradients (CTA / hero fills) hide real brand colours that never
+    // surface as a flat backgroundColor, so the flat-colour palette misses them
+    // entirely (the recall gap). Conservative: only reused gradients (count >= 2),
+    // only chromatic stops, low confidence, which is enough for downstream ranking
+    // to find them without polluting the high-confidence brand palette.
+    try {
+      const stopColorSet = new Set<string>();
+      for (const g of (gradients || [])) {
+        if ((g.count || 0) < 2) continue;
+        for (const sc of (g.stopColors || [])) stopColorSet.add(sc);
+      }
+      const stopColors = Array.from(stopColorSet);
+      if (stopColors.length) {
+        const normMap = await page.evaluate((cols) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = canvas.height = 1;
+          const ctx = canvas.getContext('2d');
+          const out = {};
+          for (const c of cols) {
+            if (/^#[0-9a-f]{6}$/i.test(c)) { out[c] = c.toLowerCase(); continue; }
+            if (/^#[0-9a-f]{3}$/i.test(c)) { out[c] = `#${c[1]}${c[1]}${c[2]}${c[2]}${c[3]}${c[3]}`.toLowerCase(); continue; }
+            if (/^#[0-9a-f]{8}$/i.test(c)) { out[c] = c.toLowerCase().slice(0, 7); continue; }
+            const m = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+            if (m) {
+              if (m[4] !== undefined && parseFloat(m[4]) < 0.3) { out[c] = null; continue; }
+              out[c] = `#${parseInt(m[1]).toString(16).padStart(2,'0')}${parseInt(m[2]).toString(16).padStart(2,'0')}${parseInt(m[3]).toString(16).padStart(2,'0')}`;
+              continue;
+            }
+            if (ctx) {
+              try {
+                ctx.clearRect(0, 0, 1, 1);
+                ctx.fillStyle = 'rgba(0,0,0,0)';
+                ctx.fillStyle = c;
+                ctx.fillRect(0, 0, 1, 1);
+                const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+                if (a > 76) { out[c] = `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`; continue; }
+              } catch {}
+            }
+            out[c] = null;
+          }
+          return out;
+        }, stopColors);
+
+        const { convertColor } = await import('../colors.js');
+        const chromaOf = (hex) => {
+          const m = /^#([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+          if (!m) return 0;
+          const r = parseInt(m[1], 16) / 255, g = parseInt(m[2], 16) / 255, b = parseInt(m[3], 16) / 255;
+          const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+          if (max === min || l < 0.08 || l > 0.92) return 0;
+          return l > 0.5 ? (max - min) / (2 - max - min) : (max - min) / (max + min);
+        };
+
+        let injected = 0;
+        for (const raw of stopColors) {
+          const normalized = normMap[raw];
+          if (!normalized || !/^#[0-9a-f]{6}$/.test(normalized)) continue;
+          if (chromaOf(normalized) < 0.2) continue;                          // skip neutral/decorative stops
+          if (colors.palette.some(c => c.normalized === normalized)) continue;
+          const entry: any = { color: raw, normalized, count: 2, confidence: 'low', sources: ['gradient'] };
+          const converted = convertColor(normalized);
+          if (converted) { entry.lch = converted.lch; entry.oklch = converted.oklch; }
+          colors.palette.push(entry);
+          injected++;
+        }
+        if (injected) log(color.success(`  ✓ Gradient colors: ${injected} injected`));
+      }
+    } catch (e) { degraded.push('gradient-colors'); console.log(color.warning('  ! Gradient color injection: failed (continuing)')); }
+
     console.log(colors.palette.length > 0 ? color.success(`  ✓ Colors: ${colors.palette.length} found`) : color.warning(`  ! Colors: 0 found`));
     console.log(typography.styles.length > 0 ? color.success(`  ✓ Typography: ${typography.styles.length} styles`) : color.warning(`  ! Typography: 0 styles`));
     console.log(spacing.commonValues.length > 0 ? color.success(`  ✓ Spacing: ${spacing.commonValues.length} values`) : color.warning(`  ! Spacing: 0 values`));
@@ -1152,6 +1223,103 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
       spinner.stop();
       log(color.success(`  ✓ Mobile: +${mobileColors.palette.length} colors`));
       } catch (e) { spinner.stop(); degraded.push('mobile'); log(color.warning('  ! Mobile: failed (continuing)')); }
+    }
+
+    // Reveal pass (standard, on by default): open click-toggle menus (megamenus,
+    // dropdowns) and advance carousels so their hidden content becomes visible,
+    // then re-scan. extractColors skips display:none/hidden/zero-size elements, so
+    // the colours of closed panels and off-screen slides are invisible to the
+    // static scan. Click-toggle menus stay open without a pointer, so a single
+    // re-scan captures the whole batch. Pure CSS :hover megamenus close when the
+    // pointer leaves and are out of scope here. Set options.reveal=false (CLI:
+    // DEMBRANDT_DISABLE_REVEAL) to skip, e.g. for deterministic QA baselines.
+    if (options.reveal !== false) {
+      try {
+      spinner.start("Revealing hidden content (menus, carousels)...");
+      // Defensive: runs on hostile third-party DOM. A click can navigate and
+      // destroy the execution context, so the whole evaluate is Node-side
+      // guarded and we never click real navigation anchors.
+      const opened = await page.evaluate(async (selector) => {
+        const isVisible = (el: Element): boolean => {
+          const h = el as HTMLElement;
+          const r = h.getBoundingClientRect();
+          const s = getComputedStyle(h);
+          return r.width > 0 && r.height > 0 && s.display !== "none" && s.visibility !== "hidden";
+        };
+        // Mirror of isSafeMenuTrigger (lib/extractors/menu-triggers.ts) — kept
+        // inline because page.evaluate runs in an isolated browser realm and
+        // cannot import. Any element with a real (non-fragment) href navigates
+        // on click and would destroy this execution context.
+        const isSafe = (el: Element): boolean => {
+          const href = el.getAttribute("href");
+          const isFragment = !href || href === "#" || href.startsWith("#");
+          if (!isFragment) return false;
+          if (el.tagName.toLowerCase() === "a" && href && href !== "#" && !href.startsWith("#")) return false;
+          return true;
+        };
+        let triggers: Element[];
+        try {
+          triggers = Array.from(document.querySelectorAll(selector)).filter((el) => isVisible(el) && isSafe(el));
+        } catch {
+          return 0; // malformed selector or hostile DOM — never throw out of evaluate
+        }
+        let count = 0;
+        for (const el of triggers.slice(0, 30)) {
+          try {
+            const before = location.href;
+            (el as HTMLElement).click();
+            if (location.href !== before) break; // navigated — stop, context may die
+            count++;
+          } catch {}
+        }
+        return count;
+      }, MENU_TRIGGER_SELECTOR).catch(() => 0);
+
+      // Advance carousels so lazily-rendered / off-screen slides mount, then the
+      // single re-scan below captures their colours. Node-side loop with a short
+      // wait per round handles transition locks (Swiper ignores clicks mid-slide)
+      // and lazy rendering. Fully guarded: never throws, stops as soon as a round
+      // advances nothing.
+      let carouselAdvances = 0;
+      try {
+        for (let round = 0; round < 3; round++) {
+          const advanced = await page.evaluate((sel) => {
+            let n = 0;
+            try {
+              const ctrls = Array.from(document.querySelectorAll(sel)).slice(0, 12);
+              for (const c of ctrls) {
+                const el = c as HTMLElement;
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0 && typeof el.click === "function") { el.click(); n++; }
+              }
+            } catch { return 0; }
+            return n;
+          }, CAROUSEL_NEXT_SELECTOR).catch(() => 0);
+          carouselAdvances += advanced;
+          if (!advanced) break;
+          await page.waitForTimeout(250 * timeoutMultiplier);
+        }
+      } catch {}
+
+      // Let panels / slides render / animate in before scanning.
+      await page.waitForTimeout(400 * timeoutMultiplier);
+
+      const menuColors = await extractColors(page);
+      const mergedPalette = [...colors.palette];
+      menuColors.palette.forEach((menuColor) => {
+        const isDuplicate = mergedPalette.some((c) => c.normalized === menuColor.normalized);
+        // Demote to medium — revealed-panel colours are weaker brand signal than
+        // the static above-the-fold scan, but stronger than hover state colours.
+        if (!isDuplicate) mergedPalette.push({ ...menuColor, confidence: "medium", source: "menu" });
+      });
+      const added = mergedPalette.length - colors.palette.length;
+      colors.palette = mergedPalette;
+
+      spinner.stop();
+      log(opened > 0 || carouselAdvances > 0
+        ? color.success(`  ✓ Reveal: ${opened} menus opened, ${carouselAdvances} carousel advances, +${added} colors`)
+        : color.info(`  i Reveal: no click-toggle menus or carousels found`));
+      } catch (e) { spinner.stop(); degraded.push('reveal'); log(color.warning('  ! Reveal: failed (continuing)')); }
     }
 
     spinner.stop();

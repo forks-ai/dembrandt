@@ -26,3 +26,10 @@ test('--help exits 0 and shows the extraction usage', () => {
   assert.match(r.stdout, /Extract design tokens/);
   assert.match(r.stdout, /--dtcg/);
 });
+
+test('reveal is standard (no enable flag exposed)', () => {
+  const r = run(['--help']);
+  assert.equal(r.status, 0);
+  // Reveal runs by default; there must be no --menus/--reveal opt-in flag.
+  assert.doesNotMatch(r.stdout, /--menus|--reveal\b/);
+});

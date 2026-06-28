@@ -59,6 +59,21 @@ export async function extractColors(page) {
       return (Math.max(r, g, b) + Math.min(r, g, b)) / 2;
     }
 
+    // HSL saturation of an opaque hex, with near-black/near-white forced to 0.
+    // Used both for the primary fallback and the near-neutral primary override.
+    function chroma(hex) {
+      if (!hex || !hex.startsWith('#')) return 0;
+      const r = parseInt(hex.slice(1, 3), 16) / 255;
+      const g = parseInt(hex.slice(3, 5), 16) / 255;
+      const b = parseInt(hex.slice(5, 7), 16) / 255;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const l = (max + min) / 2;
+      if (max === min) return 0;
+      const s = l > 0.5 ? (max - min) / (2 - max - min) : (max - min) / (max + min);
+      if (l < 0.08 || l > 0.92) return 0;
+      return s;
+    }
+
     function isValidColorValue(value) {
       if (!value) return false;
       if (value.includes("calc(") || value.includes("clamp(") || value.includes("var(")) {
@@ -145,16 +160,28 @@ export async function extractColors(page) {
     const totalElements = elements.length;
     const ctaPrimaryMap = new Map(); // normalized hex → original color for CTA backgrounds
 
+    // Mirror of CONTEXT_SCORES (lib/extractors/color-heuristics.ts) — kept inline
+    // because page.evaluate runs in an isolated realm and cannot import. Card /
+    // section / input / badge families lift colours on repeated content surfaces
+    // above the structural-noise threshold.
     const contextScores = {
-      logo: 5, brand: 5, primary: 4, cta: 4, hero: 3, button: 3, link: 2, header: 2, nav: 1,
+      logo: 5, brand: 5, primary: 4, cta: 4, hero: 3, button: 3,
+      card: 2, section: 2, feature: 2, panel: 2, input: 2, badge: 2, chip: 2,
+      footer: 2, link: 2, header: 2, nav: 1,
     };
+    // Mirror of ANCESTOR_LIFT_MAX (color-heuristics.ts): only keywords at or
+    // below this weight may lift a colour via an ANCESTOR's context.
+    const ancestorLiftMax = 2;
 
     // Colours that appear only via status/feedback or warm-utility classes are
     // not brand identity unless declared as a token or used as a CTA background.
     // The semantic words cover Bootstrap (text-danger), MUI (Mui-error),
     // Bulma (is-danger) and similar conventions; the second branch covers
     // Tailwind's numbered warm utilities (text-red-600) that carry no word.
-    const statusContext = /\b(error|danger|destructive|invalid|warning|success|alert|notice|sale|discount|badge|toast|notification)\b|(?:text|bg|border|ring|fill|stroke|from|to|via|divide|outline|decoration|accent|caret)-(?:red|rose|orange|amber|yellow)-\d/;
+    // Mirror of STATUS_CONTEXT_SOURCE (lib/extractors/color-heuristics.ts).
+    // "badge" intentionally removed: brand badges/pills are real brand colour;
+    // genuine status badges are warm-hued and caught by the numbered branch.
+    const statusContext = /\b(error|danger|destructive|invalid|warning|success|alert|notice|sale|discount|toast|notification)\b|(?:text|bg|border|ring|fill|stroke|from|to|via|divide|outline|decoration|accent|caret)-(?:red|rose|orange|amber|yellow)-\d/;
 
     elements.forEach((el) => {
       const computed = getComputedStyle(el);
@@ -178,6 +205,34 @@ export async function extractColors(page) {
       for (const [keyword, weight] of Object.entries(contextScores)) {
         if (context.includes(keyword)) score = Math.max(score, weight);
       }
+      // Real anchors and buttons carry brand intent even when their class names
+      // don't contain "link"/"button". Score by tag so chromatic link/CTA text
+      // colours aren't later discarded as structural noise (e.g. a plain styled
+      // <a> link colour the heuristic would otherwise drop).
+      if (el.tagName === 'A') score = Math.max(score, contextScores.link);
+      if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score = Math.max(score, contextScores.button);
+
+      // Deep-nested brand colours: lift via ANCESTOR context (card/section/
+      // footer/nav/...) at a capped weight when the element's own context is
+      // silent. Median labelled brand-colour xpath depth is ~10, so own-class
+      // scoring alone misses content buried inside a labelled wrapper. Mirror of
+      // ancestorLiftScore (color-heuristics.ts): bounded to 4 hops, only weights
+      // <= ancestorLiftMax, and only when own score is still baseline — so cost
+      // stays low and already-branded elements are never altered.
+      if (score <= ancestorLiftMax) {
+        let lift = 0;
+        let node = el.parentElement;
+        for (let hop = 0; hop < 4 && node && lift < ancestorLiftMax; hop++) {
+          const actx = (String(node.className || "") + " " + (node.id || "")).toLowerCase();
+          for (const [keyword, weight] of Object.entries(contextScores)) {
+            if (weight > ancestorLiftMax) continue;
+            if (actx.includes(keyword)) lift = Math.max(lift, Math.min(weight, ancestorLiftMax));
+          }
+          node = node.parentElement;
+        }
+        if (lift > score) score = lift;
+      }
+
       const isStatus = statusContext.test(context);
 
       const isCta = (context.includes('button') || context.includes('btn') || context.includes('cta')) &&
@@ -255,22 +310,28 @@ export async function extractColors(page) {
 
     const threshold = Math.max(3, Math.floor(totalElements * 0.01));
 
+    // Mirror of classifyStructural (lib/extractors/color-heuristics.ts). Saturation
+    // is computed once and reused. The high-usage branch now only fires for
+    // near-neutral colours: a saturated colour at high coverage is a deliberate
+    // brand fill (coloured section/card), not chrome noise. NaN-safe throughout.
     function isStructuralColor(data, totalElements) {
       if (data.isToken) return false;
-      const usagePercent = (data.count / totalElements) * 100;
-      const normalized = normalizeColor(data.original);
       if (data.original === "rgba(0, 0, 0, 0)" || data.original === "transparent") return true;
-      if (usagePercent > 40 && data.score < data.count * 1.2) return true;
-      if (data.bgCount === 0 && data.score < data.count * 1.5) {
-        const hex = normalized.replace('#', '');
-        const r = parseInt(hex.substring(0, 2), 16);
-        const g = parseInt(hex.substring(2, 4), 16);
-        const b = parseInt(hex.substring(4, 6), 16);
-        const max = Math.max(r, g, b);
-        const min = Math.min(r, g, b);
-        const saturation = max === 0 ? 0 : (max - min) / max;
-        if (saturation > 0.3) return true;
-      }
+      const total = totalElements > 0 ? totalElements : 1;
+      const usagePercent = (data.count / total) * 100;
+      const normalized = normalizeColor(data.original);
+      const hex = normalized.replace('#', '');
+      const r = parseInt(hex.substring(0, 2), 16);
+      const g = parseInt(hex.substring(2, 4), 16);
+      const b = parseInt(hex.substring(4, 6), 16);
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const saturation = Number.isFinite(max) && max > 0 ? (max - min) / max : 0;
+      // Near-neutral, high-usage, low-intent => layout fill / page background.
+      if (usagePercent > 40 && data.score < data.count * 1.2 && saturation <= 0.2) return true;
+      // Saturated, never a background, low-intent => incidental decoration.
+      // Background colours (bgCount > 0) are exempt so card/section fills survive.
+      if (data.bgCount === 0 && data.score < data.count * 1.5 && saturation > 0.3) return true;
       return false;
     }
 
@@ -349,7 +410,14 @@ export async function extractColors(page) {
           merged.add(i);
         }
       }
-      perceptuallyDeduped.push(similar.sort((a, b) => b.count - a.count)[0]);
+      // Prefer a declared brand token as the canonical representative of a merged
+      // cluster, then highest usage. Keeps the author's exact brand hex rather
+      // than an incidental computed value 1-2 levels off (quantization drift).
+      perceptuallyDeduped.push(
+        similar.sort((a, b) =>
+          ((tokenHexes.has(b.normalized) ? 1 : 0) - (tokenHexes.has(a.normalized) ? 1 : 0))
+          || (b.count - a.count))[0]
+      );
     });
 
     const paletteNormalizedColors = new Set(perceptuallyDeduped.map((c) => c.normalized));
@@ -371,19 +439,6 @@ export async function extractColors(page) {
 
     // Fallback: pick most chromatic non-gray palette color as primary
     if (!semanticColors.primary && perceptuallyDeduped.length > 0) {
-      function chroma(hex) {
-        if (!hex || !hex.startsWith('#')) return 0;
-        const r = parseInt(hex.slice(1, 3), 16) / 255;
-        const g = parseInt(hex.slice(3, 5), 16) / 255;
-        const b = parseInt(hex.slice(5, 7), 16) / 255;
-        const max = Math.max(r, g, b), min = Math.min(r, g, b);
-        const l = (max + min) / 2;
-        if (max === min) return 0;
-        const s = l > 0.5 ? (max - min) / (2 - max - min) : (max - min) / (max + min);
-        // Penalize near-black and near-white
-        if (l < 0.08 || l > 0.92) return 0;
-        return s;
-      }
       const best = perceptuallyDeduped
         .filter(c => c.confidence !== 'low')
         .map(c => ({ c, chroma: chroma(c.normalized), isToken: tokenHexes.has(c.normalized) }))
@@ -397,7 +452,50 @@ export async function extractColors(page) {
       if (best) semanticColors.primary = best.c.color;
     }
 
-    return { semantic: semanticColors, palette: perceptuallyDeduped, cssVariables: filteredCssVariables, _raw: rawColors };
+    // Near-neutral primaries are the dominant mis-pick: a dark text/background
+    // colour out-scores the real brand hue. If the chosen primary is near-neutral
+    // but a strong chromatic candidate exists (a declared brand token or a
+    // recurring CTA background), prefer the chromatic one. Genuinely monochrome
+    // brands have no such candidate, so they are left untouched.
+    if (semanticColors.primary) {
+      const primaryNorm = normalizeColor(semanticColors.primary);
+      if (typeof primaryNorm === 'string' && chroma(primaryNorm) < 0.12) {
+        // Only the strongest brand signals override a near-neutral primary: a
+        // declared brand token or a recurring CTA background. A merely
+        // high-confidence chromatic accent is not enough; that would demote a
+        // deliberately neutral brand identity for an incidental accent.
+        const chromatic = perceptuallyDeduped
+          .map((c) => ({ c, ch: chroma(c.normalized), isToken: tokenHexes.has(c.normalized), isCta: ctaPrimaryMap.has(c.normalized) }))
+          .filter((x) => x.ch > 0.25 && (x.isToken || x.isCta))
+          .sort((a, b) =>
+            ((b.c.count + (b.isToken ? 20 : 0) + (b.isCta ? 20 : 0)) - (a.c.count + (a.isToken ? 20 : 0) + (a.isCta ? 20 : 0)))
+            || (b.ch - a.ch))[0];
+        if (chromatic) semanticColors.primary = chromatic.c.color;
+      }
+    }
+
+    // Full detected set — every colour that passed the alpha>=0.3 gate, with NO
+    // frequency threshold and NO perceptual merge, so near-identical shades survive
+    // as the design signal they are (six reds stay six reds). This is the high-recall
+    // candidate set the ML pipeline consumes; the curated `palette` above remains the
+    // product default. `usageFrac` is an element-count proxy (true pixel area TBD).
+    const detectedTotal = Array.from(colorMap.values()).reduce((s, d) => s + (d.count || 0), 0) || 1;
+    const detected = Array.from(colorMap.entries())
+      .filter(([norm]) => typeof norm === 'string' && /^#[0-9a-f]{6}$/i.test(norm))
+      .map(([normalized, data]) => ({
+        color: data.original,
+        normalized,
+        count: data.count,
+        usageFrac: data.count / detectedTotal,
+        confidence: data.isToken
+          ? (data.score > 5 ? 'high' : 'medium')
+          : data.score > 20 ? 'high' : data.score > 5 ? 'medium' : 'low',
+        sources: Array.from(data.sources).slice(0, 5),
+        isToken: !!data.isToken,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    return { semantic: semanticColors, palette: perceptuallyDeduped, cssVariables: filteredCssVariables, detected, _raw: rawColors };
   });
 
   if (result && result.palette) {

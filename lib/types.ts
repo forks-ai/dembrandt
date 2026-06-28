@@ -404,6 +404,10 @@ export interface ExtractOptions {
   slow?: boolean;
   darkMode?: boolean;
   mobile?: boolean;
+  /** Reveal hidden content (open click-toggle menus/dropdowns, advance carousels)
+   *  and re-scan for colors. Standard behaviour, on by default; set false to skip
+   *  (used for deterministic QA baselines via the DEMBRANDT_DISABLE_REVEAL env var). */
+  reveal?: boolean;
   stealth?: boolean;
   wcag?: boolean;
   keepAnimations?: boolean;
