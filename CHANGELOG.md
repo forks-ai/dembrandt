@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.22.0] - unreleased
+## [0.23.0] - 2026-07-10
 
 ### Changed
 - Logo extraction reworked for recall and precision, measured against 103 human-judged sites: recall 0.64 -> 0.67, and known non-logos proposed cut from 11/21 to 4/21 (total proposals 206 -> 178). Concretely: header-zone selection no longer loses to cookie-dialog/modal `[class*=header]` elements; inline-`<svg>` logos wrapped in a home link are found (previously only `<img>` was); below-fold and footer logos that link home now qualify; symbol+wordmark lockups are kept as separate instances instead of collapsing to one; customer/partner-wall logos (detected structurally as a group of >=3 sizable marks in one content container) and 16-20px UI icons are no longer proposed; logos linking to a localized homepage (/en, /de) are recognized as the site's own
@@ -8,6 +8,13 @@
 
 ### Added
 - `lib/extractors/logo-heuristics.ts`: the pure, DOM-free logo decisions (home-link, position→context, third-party-brand detection, painted-box geometry, minimum logo size), serialized into the page so the browser runs the exact same code, with 30 unit tests
+- MCP server: three pure analysis tools — `get_findings` (design-system lint: contrast, consistency, duplication), `export_dtcg` (W3C Design Tokens export), `generate_design_md` (DESIGN.md brand guide) — plus `list_jobs` for the async queue
+- MCP extraction tools accept `mobile`, `cookie` (authenticated pages), and `wcag` (contrast analysis) options; `get_design_tokens` gains `darkMode`
+- Official GitHub Action for the CI drift gate (DEM-151, #116)
+- Flag orthogonality: multi-page propagation, wcag merge, save/dtcg split (`--save-output`), compatibility docs (#113)
+
+### Fixed
+- Removed an accidentally committed `node_modules` symlink and hardened `.gitignore` against symlinks (#119)
 
 ## [0.21.0] - 2026-06-29
 
