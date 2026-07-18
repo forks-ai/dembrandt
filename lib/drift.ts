@@ -64,6 +64,14 @@ export interface DriftReport {
   summary: { changed: number; added: number; removed: number };
   categories: CategoryResult[];
   changes: DriftChange[];
+  /** Comparison-validity caveats (e.g. baseline and candidate extracted at
+   *  different viewport widths). The score stands, but changes may be
+   *  environment-induced rather than design drift. */
+  warnings?: string[];
+  /** True when degradation excluded every comparable category: the score is 0
+   *  by construction, not evidence. A gate must treat this as "could not
+   *  evaluate", not as a pass. */
+  inconclusive?: boolean;
 }
 
 /* ----------------------------- color math ----------------------------- */
@@ -207,12 +215,30 @@ function fieldDiffs(b: TypographyStyle, c: TypographyStyle, cfg: DriftConfig): n
   return d;
 }
 
+// Typography severities. Two invariants pull against each other and both must
+// hold with the default weights (sum 4.0) and threshold (10):
+//  - a single CONFIRMED in-place family change must flag drift (damped peak
+//    must exceed 0.4), and mass deletion must flag drift (removal must carry
+//    full weight in the accumulating penalty so 6/10 styles removed → 0.6);
+//  - a single removed style must NOT flag drift (removals are the noisiest
+//    signal live-DOM extraction produces — usually crawl variance), and no
+//    single change may read as the whole type system being replaced (peak
+//    never maxes the category).
+const TYPO_FAMILY_PENALTY = 1.0;
+const TYPO_REMOVED_PENALTY = 1.0; // accumulating penalty: deletions scale linearly
+const TYPO_REMOVED_PEAK = 0.6; // peak: one removal (0.3 damped, overall 7.5) stays stable
+const TYPO_ADDED_PENALTY = 0.5;
+// The peak floor keeps one large regression visible among many unchanged
+// styles, damped so severity 1.0 floors the category at 50% (overall 12.5,
+// drifts) instead of 100%.
+const TYPO_PEAK_DAMP = 0.5;
+
 // Severity of one style's change, scaled by magnitude (0..1). A doubled font
 // size weighs far more than a 5% nudge — binary field counting hid that, making
 // a hero-size regression look as mild as a rounding tweak.
 function fieldPenalty(b: TypographyStyle, c: TypographyStyle, cfg: DriftConfig): number {
   let p = 0;
-  if (normFamily(b.family) !== normFamily(c.family)) p += 1;
+  if (normFamily(b.family) !== normFamily(c.family)) p += TYPO_FAMILY_PENALTY;
   if (String(b.weight) !== String(c.weight)) p += 0.5;
   const sizePct = pctChange(parseFloat(b.size), parseFloat(c.size));
   if (sizePct > cfg.dimPct) p += clamp01(sizePct / cfg.dimShiftPct);
@@ -242,8 +268,8 @@ function compareTypography(base: TypographyStyle[], cand: TypographyStyle[], cfg
     const bucket = buckets.get(key(b));
     if (!bucket || bucket.length === 0) {
       changes.push({ category: "typography", kind: "removed", label: b.context, before: fmt(b) });
-      penalty += 1;
-      peak = Math.max(peak, 1);
+      penalty += TYPO_REMOVED_PENALTY;
+      peak = Math.max(peak, TYPO_REMOVED_PEAK);
       removed++;
       continue;
     }
@@ -272,16 +298,23 @@ function compareTypography(base: TypographyStyle[], cand: TypographyStyle[], cfg
   for (const arr of buckets.values()) {
     for (const c of arr) {
       changes.push({ category: "typography", kind: "added", label: c.context, after: fmt(c) });
-      penalty += 0.5;
-      peak = Math.max(peak, 0.5);
+      penalty += TYPO_ADDED_PENALTY;
+      peak = Math.max(peak, TYPO_ADDED_PENALTY);
       added++;
     }
   }
 
   return {
     changes,
-    // Peak keeps a single large regression from being diluted by many unchanged styles.
-    result: { category: "typography", score: Math.max(categoryScore(penalty, base.length, cand.length), peak), changed, added, removed },
+    // Damped peak keeps a single large regression from being diluted by many
+    // unchanged styles without letting it max the category (see TYPO_PEAK_DAMP).
+    result: {
+      category: "typography",
+      score: Math.max(categoryScore(penalty, base.length, cand.length), peak * TYPO_PEAK_DAMP),
+      changed,
+      added,
+      removed,
+    },
   };
 }
 
@@ -407,6 +440,119 @@ function notLowConfidence(t: { confidence?: Confidence }): boolean {
   return t.confidence !== "low";
 }
 
+/** Layout-dependent tokens vary by viewport width, so a baseline and candidate
+ * extracted at different widths diff the responsive layout, not the design.
+ * Old snapshots lack meta.viewport; only warn when both sides carry it. */
+function viewportWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  const b = baseline.meta?.viewport;
+  const c = candidate.meta?.viewport;
+  if (!b || !c) return null;
+  // Persisted blobs are untrusted: widths may be strings, null, or absent.
+  // Coerce, and stay silent unless both widths are real positive numbers —
+  // Number(null) and Number('') are 0, which is finite but not a viewport.
+  const px = (v: unknown) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const bw = px(b.width);
+  const cw = px(c.width);
+  if (bw === null || cw === null || bw === cw) return null;
+  const dim = (v: { width: unknown; height: unknown }) => `${px(v.width)}x${px(v.height) ?? "?"}`;
+  return (
+    `baseline extracted at ${dim(b)}, candidate at ${dim(c)} — ` +
+    `layout-dependent changes below may be viewport-induced, not design drift. ` +
+    `Re-extract both at the same width (--screen-size).`
+  );
+}
+
+/** Both extracts must come from the same page: result.url is the final URL
+ * after redirects, so a baseline that landed on /fi/ diffed against a candidate
+ * on / compares two different surfaces. */
+function pageMismatchWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  let b: URL;
+  let c: URL;
+  try {
+    b = new URL(baseline.url);
+    c = new URL(candidate.url);
+  } catch {
+    return null;
+  }
+  const norm = (u: URL) => u.host.replace(/^www\./, "") + u.pathname.replace(/\/+$/, "");
+  if (norm(b) === norm(c)) return null;
+  return (
+    `baseline was extracted from ${b.href}, candidate from ${c.href} — ` +
+    `different pages after redirects, the diff compares two different surfaces.`
+  );
+}
+
+/** --dark-mode and --mobile merge extra passes into the palette, so extracts
+ * with and without them are not comparable: the whole palette "changes". */
+function flagMismatchWarnings(baseline: ExtractionResult, candidate: ExtractionResult): string[] {
+  const out: string[] = [];
+  for (const flag of ["darkMode", "mobile"] as const) {
+    const b = Boolean(baseline.meta?.flags?.[flag]);
+    const c = Boolean(candidate.meta?.flags?.[flag]);
+    if (b === c) continue;
+    const name = flag === "darkMode" ? "--dark-mode" : "--mobile";
+    out.push(
+      `${name} was on for the ${b ? "baseline" : "candidate"} only — ` +
+      `palette drift may be flag-induced, not design drift. Re-extract with matching flags.`
+    );
+  }
+  return out;
+}
+
+/** A snapshot taken before web fonts finished loading carries fallback
+ * families; family drift against it is suspect. */
+function fontsWarning(baseline: ExtractionResult, candidate: ExtractionResult): string | null {
+  const sides: string[] = [];
+  if (baseline.meta?.fontsReady === false) sides.push("baseline");
+  if (candidate.meta?.fontsReady === false) sides.push("candidate");
+  if (sides.length === 0) return null;
+  const pending = [
+    ...(baseline.meta?.pendingFonts ?? []),
+    ...(candidate.meta?.pendingFonts ?? []),
+  ];
+  const detail = pending.length ? ` (pending: ${[...new Set(pending)].join(", ")})` : "";
+  return (
+    `web fonts had not finished loading in the ${sides.join(" and ")} extraction${detail} — ` +
+    `typography family changes may be fallback fonts, not design drift.`
+  );
+}
+
+/** Stage names the extractor records in meta.errors / meta.degraded, mapped to
+ * the drift category they invalidate. Every pass that merges colors into the
+ * palette (dark-mode, mobile, reveal, hover-focus, gradient-colors,
+ * svg-logo-colors) degrades color when it fails: its colors go missing and
+ * would read as removed brand colors. */
+const STAGE_CATEGORY: Record<string, DriftCategory> = {
+  colors: "color",
+  typography: "typography",
+  spacing: "spacing",
+  borderRadius: "radius",
+  shadows: "shadow",
+  "dark-mode": "color",
+  mobile: "color",
+  reveal: "color",
+  "hover-focus": "color",
+  "gradient-colors": "color",
+  "svg-logo-colors": "color",
+  manifest: "color",
+};
+
+function degradedDriftCategories(r: ExtractionResult): Set<DriftCategory> {
+  const out = new Set<DriftCategory>();
+  for (const e of r.meta?.errors ?? []) {
+    const cat = STAGE_CATEGORY[e.stage];
+    if (cat) out.add(cat);
+  }
+  for (const stage of r.meta?.degraded ?? []) {
+    const cat = STAGE_CATEGORY[stage];
+    if (cat) out.add(cat);
+  }
+  return out;
+}
+
 export function computeDrift(
   baseline: ExtractionResult,
   candidate: ExtractionResult,
@@ -414,38 +560,60 @@ export function computeDrift(
 ): DriftReport {
   const cfg: DriftConfig = { ...DEFAULT_DRIFT_CONFIG, ...config, weights: { ...DEFAULT_DRIFT_CONFIG.weights, ...config.weights } };
 
+  const basePalette = paletteEntries(baseline);
+  const candPalette = paletteEntries(candidate);
+  const baseTypo = baseline.typography?.styles ?? [];
+  const candTypo = candidate.typography?.styles ?? [];
+  // Filter before the comparable check, like radius/shadows below: a list of
+  // only unparseable entries must count as "nothing to compare", not enter the
+  // average as a guaranteed-zero category.
+  const baseSpacing = (baseline.spacing?.commonValues ?? []).map((s) => String(s.px)).filter(isRealisticDimension);
+  const candSpacing = (candidate.spacing?.commonValues ?? []).map((s) => String(s.px)).filter(isRealisticDimension);
+  const baseRadius = (baseline.borderRadius?.values ?? []).filter(notLowConfidence).map((r) => r.value).filter(isRealisticDimension);
+  const candRadius = (candidate.borderRadius?.values ?? []).filter(notLowConfidence).map((r) => r.value).filter(isRealisticDimension);
+  const baseShadows = (baseline.shadows ?? []).filter(notLowConfidence).map((s) => s.shadow).filter(isSupportedShadow);
+  const candShadows = (candidate.shadows ?? []).filter(notLowConfidence).map((s) => s.shadow).filter(isSupportedShadow);
+
+  // A category empty on BOTH sides carries no information; letting it enter the
+  // average at score 0 dilutes real drift in the categories that were measured.
+  const comparable = (b: unknown[], c: unknown[]) => b.length + c.length > 0;
+
   const parts = [
-    { ...compareColors(paletteEntries(baseline), paletteEntries(candidate), cfg), w: cfg.weights.color },
+    { ...compareColors(basePalette, candPalette, cfg), w: cfg.weights.color, comparable: comparable(basePalette, candPalette) },
     {
-      ...compareTypography(baseline.typography?.styles ?? [], candidate.typography?.styles ?? [], cfg),
+      ...compareTypography(baseTypo, candTypo, cfg),
       w: cfg.weights.typography,
+      comparable: comparable(baseTypo, candTypo),
     },
     {
-      ...compareDimensions(
-        "spacing",
-        (baseline.spacing?.commonValues ?? []).map((s) => String(s.px)),
-        (candidate.spacing?.commonValues ?? []).map((s) => String(s.px)),
-        cfg
-      ),
+      ...compareDimensions("spacing", baseSpacing, candSpacing, cfg),
       w: cfg.weights.spacing,
+      comparable: comparable(baseSpacing, candSpacing),
     },
     {
-      ...compareDimensions(
-        "radius",
-        (baseline.borderRadius?.values ?? []).filter(notLowConfidence).map((r) => r.value).filter(isRealisticDimension),
-        (candidate.borderRadius?.values ?? []).filter(notLowConfidence).map((r) => r.value).filter(isRealisticDimension),
-        cfg
-      ),
+      ...compareDimensions("radius", baseRadius, candRadius, cfg),
       w: cfg.weights.radius,
+      comparable: comparable(baseRadius, candRadius),
     },
     {
-      ...compareShadows(
-        (baseline.shadows ?? []).filter(notLowConfidence).map((s) => s.shadow).filter(isSupportedShadow),
-        (candidate.shadows ?? []).filter(notLowConfidence).map((s) => s.shadow).filter(isSupportedShadow)
-      ),
+      ...compareShadows(baseShadows, candShadows),
       w: cfg.weights.shadow,
+      comparable: comparable(baseShadows, candShadows),
     },
   ];
+
+  const warnings: string[] = [];
+  for (const w of [
+    viewportWarning(baseline, candidate),
+    pageMismatchWarning(baseline, candidate),
+    ...flagMismatchWarnings(baseline, candidate),
+    fontsWarning(baseline, candidate),
+  ]) {
+    if (w) warnings.push(w);
+  }
+
+  const baseDegraded = degradedDriftCategories(baseline);
+  const candDegraded = degradedDriftCategories(candidate);
 
   // Weighted average over categories that actually have something to compare.
   let weighted = 0;
@@ -453,13 +621,38 @@ export function computeDrift(
   const categories: CategoryResult[] = [];
   const changes: DriftChange[] = [];
   for (const p of parts) {
+    const cat = p.result.category;
+    const degradedSides = [
+      baseDegraded.has(cat) ? "baseline" : null,
+      candDegraded.has(cat) ? "candidate" : null,
+    ].filter(Boolean);
+    if (degradedSides.length > 0) {
+      // Engine rule (see ExtractionMeta.degraded): a degraded category failed
+      // extraction, the brand did not change — its phantom tokens must not
+      // enter the score, the change list, the summary, or CI annotations.
+      categories.push({ category: cat, score: 0, changed: 0, added: 0, removed: 0 });
+      warnings.push(
+        `${cat} extraction was degraded in the ${degradedSides.join(" and ")} — ` +
+        `category excluded from the drift score.`
+      );
+      continue;
+    }
     categories.push(p.result);
     changes.push(...p.changes);
-    const active = p.result.changed + p.result.added + p.result.removed > 0 || p.result.score > 0;
-    if (active || p.w > 0) {
+    if (p.comparable) {
       weighted += p.result.score * p.w;
       totalW += p.w;
     }
+  }
+
+  // Degradation can exclude every comparable category. The score is then 0 by
+  // construction, not by evidence — a gate must not treat that as a clean pass.
+  const inconclusive = totalW === 0 && (baseDegraded.size > 0 || candDegraded.size > 0);
+  if (inconclusive) {
+    warnings.push(
+      "no category could be scored: every comparable category was degraded — " +
+      "this compare is inconclusive, not stable. Re-extract and retry."
+    );
   }
 
   const score = totalW > 0 ? Math.round((weighted / totalW) * 100) : 0;
@@ -478,5 +671,7 @@ export function computeDrift(
     summary,
     categories,
     changes,
+    ...(warnings.length ? { warnings } : {}),
+    ...(inconclusive ? { inconclusive: true } : {}),
   };
 }

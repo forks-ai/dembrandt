@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { randomUUID } from 'node:crypto';
 import { color } from '../formatters/theme.js';
 import { discoverLinks } from '../discovery.js';
 import { extractLogo, extractSiteName } from './logo.js';
@@ -59,7 +60,14 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function waitForSettled(page: Page, capMs: number, quietMs = 500) {
   const start = Date.now();
   try { await page.waitForLoadState("networkidle", { timeout: capMs }); } catch {}
-  try { await page.evaluate(() => document.fonts?.ready ?? null); } catch {}
+  // fonts.ready resolves only when no face is loading; a hung font request
+  // would stall it past every cap, so race it against the remaining budget.
+  try {
+    await Promise.race([
+      page.evaluate(() => document.fonts?.ready ?? null),
+      new Promise((r) => setTimeout(r, Math.max(250, capMs - (Date.now() - start)))),
+    ]);
+  } catch {}
   const remaining = Math.max(250, capMs - (Date.now() - start));
   try {
     await page.evaluate(({ quietMs, remaining }) => new Promise<void>((resolve) => {
@@ -290,14 +298,26 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
 
   const context = await browser.newContext(contextOptions);
 
+  // Setup between context creation and the main try/finally below runs outside
+  // the finally that closes the context; a throw here (malformed cookie, dead
+  // CDP browser at newPage) must still release it or shared browsers leak.
+  const closingOnError = async <T>(p: Promise<T>): Promise<T> => {
+    try {
+      return await p;
+    } catch (err) {
+      await context.close().catch(() => {});
+      throw err;
+    }
+  };
+
   const parsedCookies = parseCookies(options.cookie, url);
   if (parsedCookies.length > 0) {
-    await context.addCookies(parsedCookies);
+    await closingOnError(context.addCookies(parsedCookies));
   }
 
   if (options.stealth) {
     const stealthLocale = locale;
-    await context.addInitScript(({ loc, sw, sh }) => {
+    await closingOnError(context.addInitScript(({ loc, sw, sh }) => {
       Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
       Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
       Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
@@ -396,10 +416,10 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
           });
         };
       }
-    }, { loc: stealthLocale, sw: screenW, sh: screenH });
+    }, { loc: stealthLocale, sw: screenW, sh: screenH }));
   }
 
-  const page = await context.newPage();
+  const page = await closingOnError(context.newPage());
 
   // Track font requests to identify self-hosted custom fonts
   const fontRequests = new Set<string>();
@@ -741,6 +761,29 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
     }
 
     log(color.info("\n  Extracting design tokens...\n"));
+
+    // Font readiness is read here, at the moment styles are about to be read:
+    // a family still loading (or failed) renders as an OS fallback, and
+    // typography from this run must carry that fact (meta.fontsReady) instead
+    // of consumers inferring it from generic family names. 'unloaded' faces are
+    // declared but never requested — no rendered text uses them — so they are
+    // not fallback risks and must not be listed.
+    let fontsReady = true;
+    let pendingFonts: string[] = [];
+    try {
+      const fontState = await page.evaluate(() => ({
+        status: document.fonts ? document.fonts.status : 'loaded',
+        unsettled: document.fonts
+          ? Array.from(document.fonts)
+              .filter((f) => f.status === 'loading' || f.status === 'error')
+              .map((f) => f.family)
+          : [],
+      }));
+      fontsReady = fontState.status === 'loaded' && fontState.unsettled.length === 0;
+      pendingFonts = [...new Set(
+        fontState.unsettled.map((f) => String(f).replace(/^["']|["']$/g, ''))
+      )].sort();
+    } catch { /* best-effort; absence of the stamp must never abort extraction */ }
 
     spinner.start("Analyzing design system (17 parallel tasks)...");
     const [
@@ -1223,6 +1266,9 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
       spinner.stop();
       log(color.success(`  ✓ Mobile: +${mobileColors.palette.length} colors`));
       } catch (e) { spinner.stop(); degraded.push('mobile'); log(color.warning('  ! Mobile: failed (continuing)')); }
+      // Restore the configured viewport: every later pass (reveal, screenshot)
+      // and meta.viewport describe the desktop run, not the mobile detour.
+      try { await page.setViewportSize({ width: screenW, height: screenH }); } catch {}
     }
 
     // Reveal pass (standard, on by default): open click-toggle menus (megamenus,
@@ -1392,8 +1438,12 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
       url: page.url(),
       extractedAt: new Date().toISOString(),
       meta: {
+        snapshotId: randomUUID(),
         dembrandtVersion: options._version || null,
         schemaVersion: SCHEMA_VERSION,
+        viewport: { width: screenW, height: screenH },
+        fontsReady,
+        ...(pendingFonts.length ? { pendingFonts } : {}),
         flags: {
           ...(options.stealth && { stealth: true }),
           ...(options.darkMode && { darkMode: true }),
@@ -1490,5 +1540,10 @@ export async function extractBranding(url: string, spinner: Spinner, browser: Br
     console.error(`  ↳ URL: ${url}`);
     console.error(`  ↳ Stage: ${spinner.text || "unknown"}`);
     throw error;
+  } finally {
+    // We opened the context, we close it. Otherwise crawls accumulate one
+    // context per page, and on CDP-connected shared browsers (browser.close()
+    // only disconnects) every extraction leaks a context permanently.
+    await context.close().catch(() => {});
   }
 }

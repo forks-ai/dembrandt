@@ -448,6 +448,9 @@ program
               `${report.summary.changed} changed, ${report.summary.added} added, ${report.summary.removed} removed`
             )
           );
+          for (const w of report.warnings ?? []) {
+            savedNotices.push(color.warning(`! ${w}`));
+          }
           // --approve: accept the current extraction as the new baseline.
           // Only local files can be overwritten; App baseline ids are read-only.
           if (opts.approve) {
@@ -466,6 +469,13 @@ program
           } else if (report.status === "drift") {
             // CI gate: drift fails the run, but the report still writes first.
             process.exitCode = EXIT.DRIFT;
+          }
+          // A compare where every category was degraded proved nothing. Same
+          // rule as an unreadable baseline: "check broke, investigate" (exit
+          // RUNTIME), never a silent pass. An explicit --approve of a local
+          // baseline still wins: the user chose to accept this extraction.
+          if (report.inconclusive && !(opts.approve && mode === "local") && process.exitCode === undefined) {
+            process.exitCode = EXIT.RUNTIME;
           }
           // Under GitHub Actions, surface a failing drift gate inline on the PR
           // via workflow-command annotations (DEM-83). No-op locally. Gated on
